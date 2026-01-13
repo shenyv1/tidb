@@ -81,18 +81,33 @@ type slowQueryRetriever struct {
 }
 
 func (e *slowQueryRetriever) retrieve(ctx context.Context, sctx sessionctx.Context) ([][]types.Datum, error) {
+	retrieveStart := time.Now()
+	defer func() {
+		logutil.BgLogger().Info("[METRIC] retrieve.total", zap.Duration("duration", time.Since(retrieveStart)))
+	}()
 	if !e.initialized {
+		initStart := time.Now()
 		err := e.initialize(ctx, sctx)
+		logutil.BgLogger().Info("[METRIC] retrieve.step_initialize", zap.Duration("duration", time.Since(initStart)))
 		if err != nil {
 			return nil, err
 		}
 		ctx, e.cancel = context.WithCancel(ctx)
+		asyncStart := time.Now()
 		e.initializeAsyncParsing(ctx, sctx)
+		logutil.BgLogger().Info("[METRIC] retrieve.step_initializeAsyncParsing_start", zap.Duration("duration", time.Since(asyncStart)))
 	}
-	return e.dataForSlowLog(ctx)
+	dataStart := time.Now()
+	res, err := e.dataForSlowLog(ctx)
+	logutil.BgLogger().Info("[METRIC] retrieve.step_dataForSlowLog_total", zap.Duration("duration", time.Since(dataStart)))
+	return res, err
 }
 
 func (e *slowQueryRetriever) initialize(ctx context.Context, sctx sessionctx.Context) error {
+	initializeStart := time.Now()
+	defer func() {
+		logutil.BgLogger().Info("[METRIC] initialize.total", zap.Duration("duration", time.Since(initializeStart)))
+	}()
 	var err error
 	var hasProcessPriv bool
 	if pm := privilege.GetPrivilegeManager(sctx); pm != nil {
@@ -137,8 +152,13 @@ func (e *slowQueryRetriever) initialize(ctx context.Context, sctx sessionctx.Con
 	} else {
 		e.extractor = &plannercore.SlowQueryExtractor{}
 	}
+	logutil.BgLogger().Info("[METRIC] initialize.step_metadata_init", zap.Duration("duration", time.Since(initializeStart)))
+
 	e.initialized = true
+	getAllFilesStart := time.Now()
 	e.files, err = e.getAllFiles(ctx, sctx, sctx.GetSessionVars().SlowQueryFile)
+	logutil.BgLogger().Info("[METRIC] initialize.step_getAllFiles", zap.Duration("duration", time.Since(getAllFilesStart)))
+
 	if e.extractor.Desc {
 		slices.Reverse(e.files)
 	}
@@ -244,15 +264,23 @@ func (e *slowQueryRetriever) dataForSlowLog(ctx context.Context) ([][]types.Datu
 	e.memConsume(-e.lastFetchSize)
 	e.lastFetchSize = 0
 	for {
+		waitStart := time.Now()
 		select {
 		case task, ok = <-e.taskList:
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		}
+		logutil.BgLogger().Info("[METRIC] dataForSlowLog.step_wait_taskList", zap.Duration("duration", time.Since(waitStart)))
+
 		if !ok {
 			return nil, nil
 		}
+
+		resChStart := time.Now()
 		result := <-task.resultCh
+		logutil.BgLogger().Info("[METRIC] dataForSlowLog.step_wait_resultCh", zap.Duration("duration", time.Since(resChStart)))
+
+		processStart := time.Now()
 		rows, err := result.rows, result.err
 		if err != nil {
 			return nil, err
@@ -266,6 +294,7 @@ func (e *slowQueryRetriever) dataForSlowLog(ctx context.Context) ([][]types.Datu
 			}
 		}
 		e.lastFetchSize = calculateDatumsSize(rows)
+		logutil.BgLogger().Info("[METRIC] dataForSlowLog.step_process_data", zap.Duration("duration", time.Since(processStart)), zap.Int("rows", len(rows)))
 		return rows, nil
 	}
 }
@@ -436,6 +465,13 @@ func decomposeToSlowLogTasks(logs []slowLogBlock, num int) [][]string {
 }
 
 func (e *slowQueryRetriever) parseSlowLog(ctx context.Context, sctx sessionctx.Context, reader *bufio.Reader, logNum int) {
+	start := time.Now()
+	var totalParsed int64
+	defer func() {
+		logutil.BgLogger().Info("[METRIC] parseSlowLog.total",
+			zap.Duration("duration", time.Since(start)),
+			zap.Int64("rows", atomic.LoadInt64(&totalParsed)))
+	}()
 	defer close(e.taskList)
 	offset := offset{offset: 0, length: 0}
 	// To limit the num of go routine
@@ -446,7 +482,7 @@ func (e *slowQueryRetriever) parseSlowLog(ctx context.Context, sctx sessionctx.C
 	}
 	defer close(ch)
 	for {
-		startTime := time.Now()
+		ioStart := time.Now()
 		var logs [][]string
 		var err error
 		if !e.extractor.Desc {
@@ -454,6 +490,8 @@ func (e *slowQueryRetriever) parseSlowLog(ctx context.Context, sctx sessionctx.C
 		} else {
 			logs, err = e.getBatchLogForReversedScan(ctx, reader, &offset, logNum)
 		}
+		logutil.BgLogger().Info("[METRIC] parseSlowLog.step_io_getBatchLog", zap.Duration("duration", time.Since(ioStart)), zap.Int("batch_size", len(logs)))
+
 		if err != nil {
 			t := slowLogTask{}
 			t.resultCh = make(chan parsedSlowLog, 1)
@@ -468,7 +506,10 @@ func (e *slowQueryRetriever) parseSlowLog(ctx context.Context, sctx sessionctx.C
 			break
 		}
 		if e.stats != nil {
-			e.stats.readFile += time.Since(startTime)
+			startTime := time.Now()
+			// Update stats safely
+			elapsed := time.Since(startTime)
+			atomic.AddInt64((*int64)(&e.stats.readFile), int64(elapsed))
 		}
 		failpoint.Inject("mockReadSlowLogSlow", func(val failpoint.Value) {
 			if val.(bool) {
