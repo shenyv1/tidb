@@ -80,34 +80,18 @@ type slowQueryRetriever struct {
 }
 
 func (e *slowQueryRetriever) retrieve(ctx context.Context, sctx sessionctx.Context) ([][]types.Datum, error) {
-	logutil.BgLogger().Info("[HEARTBEAT] retrieve entered")
-	retrieveStart := time.Now()
-	defer func() {
-		logutil.BgLogger().Info("[METRIC] retrieve.total", zap.Duration("duration", time.Since(retrieveStart)))
-	}()
 	if !e.initialized {
-		initStart := time.Now()
 		err := e.initialize(ctx, sctx)
-		logutil.BgLogger().Info("[METRIC] retrieve.step_initialize", zap.Duration("duration", time.Since(initStart)))
 		if err != nil {
 			return nil, err
 		}
 		ctx, e.cancel = context.WithCancel(ctx)
-		asyncStart := time.Now()
 		e.initializeAsyncParsing(ctx, sctx)
-		logutil.BgLogger().Info("[METRIC] retrieve.step_initializeAsyncParsing_start", zap.Duration("duration", time.Since(asyncStart)))
 	}
-	dataStart := time.Now()
-	res, err := e.dataForSlowLog(ctx)
-	logutil.BgLogger().Info("[METRIC] retrieve.step_dataForSlowLog_total", zap.Duration("duration", time.Since(dataStart)))
-	return res, err
+	return e.dataForSlowLog(ctx)
 }
 
 func (e *slowQueryRetriever) initialize(ctx context.Context, sctx sessionctx.Context) error {
-	initializeStart := time.Now()
-	defer func() {
-		logutil.BgLogger().Info("[METRIC] initialize.total", zap.Duration("duration", time.Since(initializeStart)))
-	}()
 	var err error
 	var hasProcessPriv bool
 	if pm := privilege.GetPrivilegeManager(sctx); pm != nil {
@@ -152,12 +136,9 @@ func (e *slowQueryRetriever) initialize(ctx context.Context, sctx sessionctx.Con
 	} else {
 		e.extractor = &plannercore.SlowQueryExtractor{}
 	}
-	logutil.BgLogger().Info("[METRIC] initialize.step_metadata_init", zap.Duration("duration", time.Since(initializeStart)))
 
 	e.initialized = true
-	getAllFilesStart := time.Now()
 	e.files, err = e.getAllFiles(ctx, sctx, sctx.GetSessionVars().SlowQueryFile)
-	logutil.BgLogger().Info("[METRIC] initialize.step_getAllFiles", zap.Duration("duration", time.Since(getAllFilesStart)))
 
 	if e.extractor.Desc {
 		slices.Reverse(e.files)
@@ -247,7 +228,6 @@ func (e *slowQueryRetriever) getNextReader() (*bufio.Reader, error) {
 }
 
 func (e *slowQueryRetriever) parseDataForSlowLog(ctx context.Context, sctx sessionctx.Context) {
-	logutil.BgLogger().Info("[HEARTBEAT] PARALLEL_V3_ACTIVE")
 	defer e.wg.Done()
 	if e.taskList == nil {
 		return
@@ -311,23 +291,18 @@ func (e *slowQueryRetriever) dataForSlowLog(ctx context.Context) ([][]types.Datu
 	e.memConsume(-e.lastFetchSize)
 	e.lastFetchSize = 0
 	for {
-		waitStart := time.Now()
 		select {
 		case task, ok = <-e.taskList:
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		}
-		logutil.BgLogger().Info("[METRIC] dataForSlowLog.step_wait_taskList", zap.Duration("duration", time.Since(waitStart)))
 
 		if !ok {
 			return nil, nil
 		}
 
-		resChStart := time.Now()
 		result := <-task.resultCh
-		logutil.BgLogger().Info("[METRIC] dataForSlowLog.step_wait_resultCh", zap.Duration("duration", time.Since(resChStart)))
 
-		processStart := time.Now()
 		rows, err := result.rows, result.err
 		if err != nil {
 			return nil, err
@@ -341,7 +316,6 @@ func (e *slowQueryRetriever) dataForSlowLog(ctx context.Context) ([][]types.Datu
 			}
 		}
 		e.lastFetchSize = calculateDatumsSize(rows)
-		logutil.BgLogger().Info("[METRIC] dataForSlowLog.step_process_data", zap.Duration("duration", time.Since(processStart)), zap.Int("rows", len(rows)))
 		return rows, nil
 	}
 }
@@ -992,14 +966,6 @@ type logFile struct {
 
 // getAllFiles is used to get all slow-log needed to parse, it is exported for test.
 func (e *slowQueryRetriever) getAllFiles(ctx context.Context, sctx sessionctx.Context, logFilePath string) ([]logFile, error) {
-	totalFileNum := 0
-	if e.stats != nil {
-		startTime := time.Now()
-		defer func() {
-			e.stats.initialize = time.Since(startTime)
-			e.stats.totalFileNum = totalFileNum
-		}()
-	}
 	logDir := filepath.Dir(logFilePath)
 	ext := filepath.Ext(logFilePath)
 	prefix := logFilePath[:len(logFilePath)-len(ext)]
@@ -1020,11 +986,9 @@ func (e *slowQueryRetriever) getAllFiles(ctx context.Context, sctx sessionctx.Co
 		}
 	}
 
-	totalFileNum = len(filteredFiles)
-	logFiles := make([]logFile, 0, totalFileNum)
+	logFiles := make([]logFile, 0, len(filteredFiles))
 	var mu sync.Mutex
 	var workerWG sync.WaitGroup
-	errCh := make(chan error, len(filteredFiles))
 
 	// Parallelize file metadata collection
 	concurrent := runtime.NumCPU()
@@ -1106,44 +1070,44 @@ func (e *slowQueryRetriever) getAllFiles(ctx context.Context, sctx sessionctx.Co
 	}
 	workerWG.Wait()
 
-	select {
-	case err := <-errCh:
-		return nil, err
-	default:
-	}
-
-	// Sort by start time
-	slices.SortFunc(logFiles, func(i, j logFile) int {
-		return i.start.Compare(j.start)
+	slices.SortFunc(logFiles, func(a, b logFile) int {
+		return a.start.Compare(b.start)
 	})
 
-	// Assume no time range overlap in log files and remove unnecessary log files for compressed files.
-	var ret []logFile
-	for i, file := range logFiles {
-		if i == len(logFiles)-1 || !file.compressed || !e.checker.enableTimeCheck {
-			ret = append(ret, file)
-			continue
-		}
-		start := logFiles[i].start
-		// use next file.start as endTime
-		end := logFiles[i+1].start
-		inTimeRanges := false
-		for _, tr := range e.checker.timeRanges {
-			if !(start.Compare(tr.endTime) > 0 || end.Compare(tr.startTime) < 0) {
-				inTimeRanges = true
-				break
-			}
-		}
-		if inTimeRanges {
-			ret = append(ret, file)
-		} else {
-			file.file.Close()
-		}
-	}
-	return ret, nil
+	return logFiles, nil
 }
 
-func (*slowQueryRetriever) getFileStartTime(ctx context.Context, file *os.File, compressed bool) (time.Time, error) {
+func (e *slowQueryRetriever) initializeAsyncParsing(ctx context.Context, sctx sessionctx.Context) {
+	e.taskList = make(chan slowLogTask, runtime.NumCPU()*4)
+	e.wg.Add(1)
+	go func() {
+		e.parseDataForSlowLog(ctx, sctx)
+	}()
+}
+
+func calculateLogSize(log []string) int64 {
+	size := 0
+	for _, line := range log {
+		size += len(line)
+	}
+	return int64(size)
+}
+
+func calculateDatumsSize(rows [][]types.Datum) int64 {
+	size := int64(0)
+	for _, row := range rows {
+		size += types.EstimatedMemUsage(row, 1)
+	}
+	return size
+}
+
+func (e *slowQueryRetriever) memConsume(bytes int64) {
+	if e.memTracker != nil {
+		e.memTracker.Consume(bytes)
+	}
+}
+
+func (e *slowQueryRetriever) getFileStartTime(ctx context.Context, file *os.File, compressed bool) (time.Time, error) {
 	var t time.Time
 	_, err := file.Seek(0, io.SeekStart)
 	if err != nil {
@@ -1227,7 +1191,7 @@ func (*slowQueryRuntimeStats) Tp() int {
 	return execdetails.TpSlowQueryRuntimeStat
 }
 
-func (*slowQueryRetriever) getFileEndTime(ctx context.Context, file *os.File) (time.Time, error) {
+func (e *slowQueryRetriever) getFileEndTime(ctx context.Context, file *os.File) (time.Time, error) {
 	var t time.Time
 	var tried int
 	stat, err := file.Stat()
@@ -1312,42 +1276,4 @@ func readLastLines(ctx context.Context, file *os.File, endCursor int64) ([]strin
 	}
 	finalStr := string(lines[firstNonNewlinePos:])
 	return strings.Split(strings.ReplaceAll(finalStr, "\r\n", "\n"), "\n"), len(finalStr), nil
-}
-
-func (e *slowQueryRetriever) initializeAsyncParsing(ctx context.Context, sctx sessionctx.Context) {
-	// 强制使用 NumCPU 以确保本地解析充分利用多核能力
-	concurrent := runtime.NumCPU()
-	if concurrent < 4 {
-		concurrent = 4
-	}
-	// 增大容量防止 Worker 被主线程消费速度阻塞
-	e.taskList = make(chan slowLogTask, concurrent*4)
-	e.wg.Add(1)
-	go func() {
-		start := time.Now()
-		e.parseDataForSlowLog(ctx, sctx)
-		logutil.BgLogger().Info("[METRIC] initializeAsyncParsing.parseDataForSlowLog_finished", zap.Duration("duration", time.Since(start)))
-	}()
-}
-
-func calculateLogSize(log []string) int64 {
-	size := 0
-	for _, line := range log {
-		size += len(line)
-	}
-	return int64(size)
-}
-
-func calculateDatumsSize(rows [][]types.Datum) int64 {
-	size := int64(0)
-	for _, row := range rows {
-		size += types.EstimatedMemUsage(row, 1)
-	}
-	return size
-}
-
-func (e *slowQueryRetriever) memConsume(bytes int64) {
-	if e.memTracker != nil {
-		e.memTracker.Consume(bytes)
-	}
 }
