@@ -788,7 +788,7 @@ select 9;`
 		if len(retriever.files) > 0 {
 			reader := bufio.NewReader(retriever.files[0].file)
 			offset := &offset{length: 0, offset: 0}
-			rows, _, err := retriever.getBatchLogForReversedScan(context.Background(), reader, offset, 3, 0)
+			rows, err := retriever.getBatchLogForReversedScan(context.Background(), reader, offset, 3)
 			require.NoError(t, err)
 			for _, row := range rows {
 				for j, log := range row {

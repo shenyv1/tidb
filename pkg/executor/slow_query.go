@@ -56,7 +56,7 @@ import (
 type signalsKey struct{}
 
 // ParseSlowLogBatchSize is the batch size of slow-log lines for a worker to parse, exported for testing.
-var ParseSlowLogBatchSize = 1024
+var ParseSlowLogBatchSize = 64
 
 // slowQueryRetriever is used to read slow log data.
 type slowQueryRetriever struct {
@@ -234,53 +234,24 @@ func (e *slowQueryRetriever) parseDataForSlowLog(ctx context.Context, sctx sessi
 	}
 	defer close(e.taskList)
 
-	// Use NumCPU to ensure maximum parallelism
-	concurrent := runtime.NumCPU()
-	if concurrent < 4 {
-		concurrent = 4
-	}
-	var workerWG sync.WaitGroup
-
-	fileCh := make(chan *logFile, len(e.files))
+	// Process files sequentially to maintain order
 	for i := range e.files {
-		fileCh <- &e.files[i]
-	}
-	close(fileCh)
+		file := &e.files[i]
 
-	for range concurrent {
-		workerWG.Add(1)
-		go func() {
-			defer workerWG.Done()
-			for {
-				var file *logFile
-				select {
-				case <-ctx.Done():
-					return
-				case f, ok := <-fileCh:
-					if !ok {
-						return
-					}
-					file = f
-				}
-
-				var reader *bufio.Reader
-				if !file.compressed {
-					reader = bufio.NewReader(file.file)
-				} else {
-					gr, err := gzip.NewReader(file.file)
-					if err != nil {
-						sctx.GetSessionVars().StmtCtx.AppendWarning(err)
-						continue
-					}
-					reader = bufio.NewReader(gr)
-				}
-
-				e.parseSlowLog(ctx, sctx, reader, ParseSlowLogBatchSize)
+		var reader *bufio.Reader
+		if !file.compressed {
+			reader = bufio.NewReader(file.file)
+		} else {
+			gr, err := gzip.NewReader(file.file)
+			if err != nil {
+				sctx.GetSessionVars().StmtCtx.AppendWarning(err)
+				continue
 			}
-		}()
-	}
+			reader = bufio.NewReader(gr)
+		}
 
-	workerWG.Wait()
+		e.parseSlowLog(ctx, sctx, reader, ParseSlowLogBatchSize)
+	}
 }
 
 func (e *slowQueryRetriever) dataForSlowLog(ctx context.Context) ([][]types.Datum, error) {
@@ -362,19 +333,29 @@ type slowLogTask struct {
 
 type slowLogBlock []string
 
-func (*slowQueryRetriever) getBatchLog(ctx context.Context, reader *bufio.Reader, _ *offset, num int, fileLine int) ([][]string, int, error) {
+func (e *slowQueryRetriever) getBatchLog(ctx context.Context, reader *bufio.Reader, offset *offset, num int) ([][]string, error) {
 	var line string
 	log := make([]string, 0, num)
 	var err error
 	for range num {
 		for {
 			if isCtxDone(ctx) {
-				return nil, fileLine, ctx.Err()
+				return nil, ctx.Err()
 			}
-			fileLine++
+			e.fileLine++
 			lineByte, err := getOneLine(reader)
 			if err != nil {
-				return [][]string{log}, fileLine, err
+				if err == io.EOF {
+					e.fileLine = 0
+					newReader, err := e.getNextReader()
+					if newReader == nil || err != nil {
+						return [][]string{log}, err
+					}
+					offset.length = len(log)
+					reader.Reset(newReader)
+					continue
+				}
+				return [][]string{log}, err
 			}
 			line = string(hack.String(lineByte))
 			log = append(log, line)
@@ -386,10 +367,10 @@ func (*slowQueryRetriever) getBatchLog(ctx context.Context, reader *bufio.Reader
 			}
 		}
 	}
-	return [][]string{log}, fileLine, err
+	return [][]string{log}, err
 }
 
-func (e *slowQueryRetriever) getBatchLogForReversedScan(ctx context.Context, reader *bufio.Reader, offset *offset, num int, fileLine int) ([][]string, int, error) {
+func (e *slowQueryRetriever) getBatchLogForReversedScan(ctx context.Context, reader *bufio.Reader, offset *offset, num int) ([][]string, error) {
 	// reader maybe change when read previous file.
 	inputReader := reader
 	defer func() {
@@ -406,26 +387,26 @@ func (e *slowQueryRetriever) getBatchLogForReversedScan(ctx context.Context, rea
 	scanPreviousFile := false
 	for {
 		if isCtxDone(ctx) {
-			return nil, fileLine, ctx.Err()
+			return nil, ctx.Err()
 		}
-		fileLine++
+		e.fileLine++
 		lineByte, err := getOneLine(reader)
 		if err != nil {
 			if err == io.EOF {
 				if len(log) == 0 {
 					decomposedSlowLogTasks := decomposeToSlowLogTasks(logs, num)
 					offset.length = len(decomposedSlowLogTasks)
-					return decomposedSlowLogTasks, fileLine, nil
+					return decomposedSlowLogTasks, nil
 				}
-				fileLine = 0
+				e.fileLine = 0
 				reader, err = e.getPreviousReader()
 				if reader == nil || err != nil {
-					return decomposeToSlowLogTasks(logs, num), fileLine, nil
+					return decomposeToSlowLogTasks(logs, num), nil
 				}
 				scanPreviousFile = true
 				continue
 			}
-			return nil, fileLine, err
+			return nil, err
 		}
 		line = string(hack.String(lineByte))
 		if !hasStartFlag && strings.HasPrefix(line, variable.SlowLogStartPrefixStr) {
@@ -446,7 +427,7 @@ func (e *slowQueryRetriever) getBatchLogForReversedScan(ctx context.Context, rea
 			}
 		}
 	}
-	return decomposeToSlowLogTasks(logs, num), fileLine, err
+	return decomposeToSlowLogTasks(logs, num), err
 }
 
 func decomposeToSlowLogTasks(logs []slowLogBlock, num int) [][]string {
@@ -476,17 +457,23 @@ func decomposeToSlowLogTasks(logs []slowLogBlock, num int) [][]string {
 }
 
 func (e *slowQueryRetriever) parseSlowLog(ctx context.Context, sctx sessionctx.Context, reader *bufio.Reader, logNum int) {
-	fileLine := 0 // Local line number to eliminate concurrency competition
 	offset := offset{offset: 0, length: 0}
+	// To limit the num of go routine
+	concurrent := sctx.GetSessionVars().Concurrency.DistSQLScanConcurrency()
+	ch := make(chan int, concurrent)
+	if e.stats != nil {
+		e.stats.concurrent = concurrent
+	}
+	defer close(ch)
 	for {
+		startTime := time.Now()
 		var logs [][]string
 		var err error
 		if !e.extractor.Desc {
-			logs, fileLine, err = e.getBatchLog(ctx, reader, &offset, logNum, fileLine)
+			logs, err = e.getBatchLog(ctx, reader, &offset, logNum)
 		} else {
-			logs, fileLine, err = e.getBatchLogForReversedScan(ctx, reader, &offset, logNum, fileLine)
+			logs, err = e.getBatchLogForReversedScan(ctx, reader, &offset, logNum)
 		}
-
 		if err != nil && err != io.EOF {
 			t := slowLogTask{}
 			t.resultCh = make(chan parsedSlowLog, 1)
@@ -498,30 +485,44 @@ func (e *slowQueryRetriever) parseSlowLog(ctx context.Context, sctx sessionctx.C
 			e.sendParsedSlowLogCh(t, parsedSlowLog{nil, err})
 			return
 		}
-
+		if len(logs) == 0 || len(logs[0]) == 0 {
+			break
+		}
+		if e.stats != nil {
+			e.stats.readFile += time.Since(startTime)
+		}
+		failpoint.Inject("mockReadSlowLogSlow", func(val failpoint.Value) {
+			if val.(bool) {
+				signals := ctx.Value(signalsKey{}).([]chan int)
+				signals[0] <- 1
+				<-signals[1]
+			}
+		})
 		for i := range logs {
 			log := logs[i]
-			if len(log) == 0 {
-				continue
-			}
 			t := slowLogTask{}
 			t.resultCh = make(chan parsedSlowLog, 1)
 			start := offset
+			ch <- 1
 			select {
 			case <-ctx.Done():
 				return
 			case e.taskList <- t:
 			}
-
 			e.wg.Add(1)
 			go func() {
 				defer e.wg.Done()
 				result, err := e.parseLog(ctx, sctx, log, start)
 				e.sendParsedSlowLogCh(t, parsedSlowLog{result, err})
+				<-ch
 			}()
-
-			offset.offset = fileLine
+			offset.offset = e.fileLine
 			offset.length = 0
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
 		}
 
 		if err == io.EOF {
